@@ -7,7 +7,6 @@ import shutil
 import logging
 import time
 import re
-import requests
 import ssl
 import json
 
@@ -15,46 +14,74 @@ from distutils.version import StrictVersion
 
 from threading import Thread, Event
 from queue import Queue
+from cachetools import LFUCache
 from flask_cors import CORS
 from flask_cache_bust import init_cache_busting
 
 from pogom import config
 from pogom.app import Pogom
 from pogom.utils import get_args, now
+from pogom.altitude import get_gmaps_altitude
 
 from pogom.search import search_overseer_thread
-from pogom.models import init_database, create_tables, drop_tables, Pokemon, db_updater, clean_db_loop
+from pogom.models import (init_database, create_tables, drop_tables,
+                          Pokemon, db_updater, clean_db_loop)
 from pogom.webhook import wh_updater
 
-from pogom.proxy import check_proxies
+from pogom.proxy import check_proxies, proxies_refresher
 
-# Currently supported pgoapi
+# Currently supported pgoapi.
 pgoapi_version = "1.1.7"
 
-# Moved here so logger is configured at load time
-logging.basicConfig(format='%(asctime)s [%(threadName)16s][%(module)14s][%(levelname)8s] %(message)s')
+# Moved here so logger is configured at load time.
+logging.basicConfig(
+    format='%(asctime)s [%(threadName)16s][%(module)14s][%(levelname)8s] ' +
+    '%(message)s')
 log = logging.getLogger()
 
-# Make sure pogom/pgoapi is actually removed if it is an empty directory
-# This is a leftover directory from the time pgoapi was embedded in PokemonGo-Map
-# The empty directory will cause problems with `import pgoapi` so it needs to go
+# Make sure pogom/pgoapi is actually removed if it is an empty directory.
+# This is a leftover directory from the time pgoapi was embedded in
+# PokemonGo-Map.
+# The empty directory will cause problems with `import pgoapi` so it needs to
+# go.
+# Now also removes the pogom/libencrypt and pokecrypt-pgoapi folders,
+# don't cause issues but aren't needed.
 oldpgoapiPath = os.path.join(os.path.dirname(__file__), "pogom/pgoapi")
+oldlibPath = os.path.join(os.path.dirname(__file__), "pokecrypt-pgoapi")
+oldoldlibPath = os.path.join(os.path.dirname(__file__), "pogom/libencrypt")
 if os.path.isdir(oldpgoapiPath):
-    log.info("I found %s, but its no longer used. Going to remove it...", oldpgoapiPath)
+    log.warn("I found a really really old pgoapi thing, but its no longer " +
+             "used. Going to remove it...", oldpgoapiPath)
     shutil.rmtree(oldpgoapiPath)
-    log.info("Done!")
+    log.warn("Done!")
+if os.path.isdir(oldlibPath):
+    log.warn("I found the pokecrypt-pgoapi folder/submodule, but its no " +
+             "longer used. Going to remove it...", oldpgoapiPath)
+    shutil.rmtree(oldlibPath)
+    log.warn("Done!")
+if os.path.isdir(oldoldlibPath):
+    log.warn("I found the old libencrypt folder, from when we used to " +
+             "bundle encrypt libs, but its no longer used. " +
+             "Going to remove it...", oldpgoapiPath)
+    shutil.rmtree(oldoldlibPath)
+    log.warn("Done!")
 
-# Assert pgoapi is installed
+# Assert pgoapi is installed.
 try:
     import pgoapi
     from pgoapi import utilities as util
 except ImportError:
-    log.critical("It seems `pgoapi` is not installed. You must run pip install -r requirements.txt again")
+    log.critical(
+        "It seems `pgoapi` is not installed. Try running " +
+        "pip install --upgrade -r requirements.txt.")
     sys.exit(1)
 
-# Assert pgoapi >= pgoapi_version
-if not hasattr(pgoapi, "__version__") or StrictVersion(pgoapi.__version__) < StrictVersion(pgoapi_version):
-    log.critical("It seems `pgoapi` is not up-to-date. You must run pip install -r requirements.txt again")
+# Assert pgoapi >= pgoapi_version.
+if (not hasattr(pgoapi, "__version__") or
+        StrictVersion(pgoapi.__version__) < StrictVersion(pgoapi_version)):
+    log.critical(
+        "It seems `pgoapi` is not up-to-date. Try running " +
+        "pip install --upgrade -r requirements.txt again.")
     sys.exit(1)
 
 
@@ -80,32 +107,37 @@ def install_thread_excepthook():
     Thread.run = run
 
 
-# Exception handler will log unhandled exceptions
+# Exception handler will log unhandled exceptions.
 def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
 
-    log.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    log.error("Uncaught exception", exc_info=(
+        exc_type, exc_value, exc_traceback))
 
 
 def main():
-    # Patch threading to make exceptions catchable
+    # Patch threading to make exceptions catchable.
     install_thread_excepthook()
 
-    # Make sure exceptions get logged
+    # Make sure exceptions get logged.
     sys.excepthook = handle_exception
 
     args = get_args()
 
-    # Add file logging if enabled
+    # Add file logging if enabled.
     if args.verbose and args.verbose != 'nofile':
         filelog = logging.FileHandler(args.verbose)
-        filelog.setFormatter(logging.Formatter('%(asctime)s [%(threadName)16s][%(module)14s][%(levelname)8s] %(message)s'))
+        filelog.setFormatter(logging.Formatter(
+            '%(asctime)s [%(threadName)16s][%(module)14s][%(levelname)8s] ' +
+            '%(message)s'))
         logging.getLogger('').addHandler(filelog)
     if args.very_verbose and args.very_verbose != 'nofile':
         filelog = logging.FileHandler(args.very_verbose)
-        filelog.setFormatter(logging.Formatter('%(asctime)s [%(threadName)16s][%(module)14s][%(levelname)8s] %(message)s'))
+        filelog.setFormatter(logging.Formatter(
+            '%(asctime)s [%(threadName)16s][%(module)14s][%(levelname)8s] ' +
+            '%(message)s'))
         logging.getLogger('').addHandler(filelog)
 
     if args.verbose or args.very_verbose:
@@ -113,13 +145,23 @@ def main():
     else:
         log.setLevel(logging.INFO)
 
-    # Let's not forget to run Grunt / Only needed when running with webserver
+    # Let's not forget to run Grunt / Only needed when running with webserver.
     if not args.no_server:
-        if not os.path.exists(os.path.join(os.path.dirname(__file__), 'static/dist')):
-            log.critical('Missing front-end assets (static/dist) -- please run "npm install && npm run build" before starting the server')
+        if not os.path.exists(
+                os.path.join(os.path.dirname(__file__), 'static/dist')):
+            log.critical(
+                'Missing front-end assets (static/dist) -- please run ' +
+                '"npm install && npm run build" before starting the server.')
             sys.exit()
 
-    # These are very noisey, let's shush them up a bit
+        # You need custom image files now.
+        if not os.path.isfile(
+                os.path.join(os.path.dirname(__file__),
+                             'static/icons-sprite.png')):
+            log.critical('Missing sprite files.')
+            sys.exit()
+
+    # These are very noisy, let's shush them up a bit.
     logging.getLogger('peewee').setLevel(logging.INFO)
     logging.getLogger('requests').setLevel(logging.WARNING)
     logging.getLogger('pgoapi.pgoapi').setLevel(logging.WARNING)
@@ -130,7 +172,7 @@ def main():
     config['parse_pokestops'] = not args.no_pokestops
     config['parse_gyms'] = not args.no_gyms
 
-    # Turn these back up if debugging
+    # Turn these back up if debugging.
     if args.verbose or args.very_verbose:
         logging.getLogger('pgoapi').setLevel(logging.DEBUG)
     if args.very_verbose:
@@ -141,7 +183,7 @@ def main():
         logging.getLogger('rpc_api').setLevel(logging.DEBUG)
         logging.getLogger('werkzeug').setLevel(logging.DEBUG)
 
-    # use lat/lng directly if matches such a pattern
+    # Use lat/lng directly if matches such a pattern.
     prog = re.compile("^(\-?\d+\.\d+),?\s?(\-?\d+\.\d+)$")
     res = prog.match(args.location)
     if res:
@@ -151,36 +193,45 @@ def main():
         log.debug('Looking up coordinates in API')
         position = util.get_pos_by_name(args.location)
 
-    # Use the latitude and longitude to get the local altitude from Google
-    try:
-        url = 'https://maps.googleapis.com/maps/api/elevation/json?locations={},{}'.format(
-            str(position[0]), str(position[1]))
-        altitude = requests.get(url).json()[u'results'][0][u'elevation']
+    if position is None or not any(position):
+        log.error("Location not found: '{}'".format(args.location))
+        sys.exit()
+
+    # Use the latitude and longitude to get the local altitude from Google.
+    (altitude, status) = get_gmaps_altitude(position[0], position[1],
+                                            args.gmaps_key)
+    if altitude is not None:
         log.debug('Local altitude is: %sm', altitude)
         position = (position[0], position[1], altitude)
-    except (requests.exceptions.RequestException, IndexError, KeyError):
-        log.error('Unable to retrieve altitude from Google APIs; setting to 0')
-
-    if not any(position):
-        log.error('Could not get a position by name, aborting')
-        sys.exit()
+    else:
+        if status == 'REQUEST_DENIED':
+            log.error(
+                'Google API Elevation request was denied. You probably ' +
+                'forgot to enable elevation api in https://console.' +
+                'developers.google.com/apis/api/elevation_backend/')
+            sys.exit()
+        else:
+            log.error('Unable to retrieve altitude from Google APIs' +
+                      'setting to 0')
 
     log.info('Parsed location is: %.4f/%.4f/%.4f (lat/lng/alt)',
              position[0], position[1], position[2])
 
     if args.no_pokemon:
-        log.info('Parsing of Pokemon disabled')
+        log.info('Parsing of Pokemon disabled.')
     if args.no_pokestops:
-        log.info('Parsing of Pokestops disabled')
+        log.info('Parsing of Pokestops disabled.')
     if args.no_gyms:
-        log.info('Parsing of Gyms disabled')
+        log.info('Parsing of Gyms disabled.')
     if args.encounter:
-        log.info('Encountering pokemon enabled')
+        log.info('Encountering pokemon enabled.')
 
     config['LOCALE'] = args.locale
     config['CHINA'] = args.china
 
     app = Pogom(__name__)
+    app.before_request(app.validate_request)
+
     db = init_database(app)
     if args.clear_db:
         log.info('Clearing database')
@@ -192,7 +243,7 @@ def main():
 
     app.set_current_location(position)
 
-    # Control the search status (running or not) across threads
+    # Control the search status (running or not) across threads.
     pause_bit = Event()
     pause_bit.clear()
     if args.on_demand_timeout > 0:
@@ -200,65 +251,84 @@ def main():
 
     heartbeat = [now()]
 
-    # Setup the location tracking queue and push the first location on
+    # Setup the location tracking queue and push the first location on.
     new_location_queue = Queue()
     new_location_queue.put(position)
 
     # DB Updates
     db_updates_queue = Queue()
 
-    # Thread(s) to process database updates
+    # Thread(s) to process database updates.
     for i in range(args.db_threads):
         log.debug('Starting db-updater worker thread %d', i)
-        t = Thread(target=db_updater, name='db-updater-{}'.format(i), args=(args, db_updates_queue))
+        t = Thread(target=db_updater, name='db-updater-{}'.format(i),
+                   args=(args, db_updates_queue, db))
         t.daemon = True
         t.start()
 
-    # db clearner; really only need one ever
+    # db cleaner; really only need one ever.
     if not args.disable_clean:
         t = Thread(target=clean_db_loop, name='db-cleaner', args=(args,))
         t.daemon = True
         t.start()
 
-    # WH Updates
+    # WH updates queue & WH gym/pokéstop unique key LFU cache.
+    # The LFU cache will stop the server from resending the same data an
+    # infinite number of times.
+    # TODO: Rework webhooks entirely so a LFU cache isn't necessary.
     wh_updates_queue = Queue()
+    wh_key_cache = LFUCache(maxsize=args.wh_lfu_size)
 
-    # Thread to process webhook updates
+    # Thread to process webhook updates.
     for i in range(args.wh_threads):
         log.debug('Starting wh-updater worker thread %d', i)
-        t = Thread(target=wh_updater, name='wh-updater-{}'.format(i), args=(args, wh_updates_queue))
+        t = Thread(target=wh_updater, name='wh-updater-{}'.format(i),
+                   args=(args, wh_updates_queue, wh_key_cache))
         t.daemon = True
         t.start()
 
     if not args.only_server:
 
-        # Check all proxies before continue so we know they are good
-        if args.proxy and not args.proxy_skip_check:
+        # Processing proxies if set (load from file, check and overwrite old
+        # args.proxy with new working list)
+        args.proxy = check_proxies(args)
 
-            # Overwrite old args.proxy with new working list
-            args.proxy = check_proxies(args)
+        # Run periodical proxy refresh thread
+        if (args.proxy_file is not None) and (args.proxy_refresh > 0):
+            t = Thread(target=proxies_refresher,
+                       name='proxy-refresh', args=(args,))
+            t.daemon = True
+            t.start()
+        else:
+            log.info('Periodical proxies refresh disabled.')
 
-        # Gather the pokemons!
+        # Gather the Pokemon!
 
-        # attempt to dump the spawn points (do this before starting threads of endure the woe)
-        if args.spawnpoint_scanning and args.spawnpoint_scanning != 'nofile' and args.dump_spawnpoints:
+        # Attempt to dump the spawn points (do this before starting threads of
+        # endure the woe).
+        if (args.spawnpoint_scanning and
+                args.spawnpoint_scanning != 'nofile' and
+                args.dump_spawnpoints):
             with open(args.spawnpoint_scanning, 'w+') as file:
                 log.info('Saving spawn points to %s', args.spawnpoint_scanning)
-                spawns = Pokemon.get_spawnpoints_in_hex(position, args.step_limit)
+                spawns = Pokemon.get_spawnpoints_in_hex(
+                    position, args.step_limit)
                 file.write(json.dumps(spawns))
                 log.info('Finished exporting spawn points')
 
-        argset = (args, new_location_queue, pause_bit, heartbeat, db_updates_queue, wh_updates_queue)
+        argset = (args, new_location_queue, pause_bit,
+                  heartbeat, db_updates_queue, wh_updates_queue)
 
         log.debug('Starting a %s search thread', args.scheduler)
-        search_thread = Thread(target=search_overseer_thread, name='search-overseer', args=argset)
+        search_thread = Thread(target=search_overseer_thread,
+                               name='search-overseer', args=argset)
         search_thread.daemon = True
         search_thread.start()
 
     if args.cors:
         CORS(app)
 
-    # No more stale JS
+    # No more stale JS.
     init_cache_busting(app)
 
     app.set_search_control(pause_bit)
@@ -269,20 +339,26 @@ def main():
     config['GMAPS_KEY'] = args.gmaps_key
 
     if args.no_server:
-        # This loop allows for ctrl-c interupts to work since flask won't be holding the program open
+        # This loop allows for ctrl-c interupts to work since flask won't be
+        # holding the program open.
         while search_thread.is_alive():
             time.sleep(60)
     else:
         ssl_context = None
-        if args.ssl_certificate and args.ssl_privatekey \
-                and os.path.exists(args.ssl_certificate) and os.path.exists(args.ssl_privatekey):
+        if (args.ssl_certificate and args.ssl_privatekey and
+                os.path.exists(args.ssl_certificate) and
+                os.path.exists(args.ssl_privatekey)):
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
-            ssl_context.load_cert_chain(args.ssl_certificate, args.ssl_privatekey)
+            ssl_context.load_cert_chain(
+                args.ssl_certificate, args.ssl_privatekey)
             log.info('Web server in SSL mode.')
         if args.verbose or args.very_verbose:
-            app.run(threaded=True, use_reloader=False, debug=True, host=args.host, port=args.port, ssl_context=ssl_context)
+            app.run(threaded=True, use_reloader=False, debug=True,
+                    host=args.host, port=args.port, ssl_context=ssl_context)
         else:
-            app.run(threaded=True, use_reloader=False, debug=False, host=args.host, port=args.port, ssl_context=ssl_context)
+            app.run(threaded=True, use_reloader=False, debug=False,
+                    host=args.host, port=args.port, ssl_context=ssl_context)
+
 
 if __name__ == '__main__':
     main()
